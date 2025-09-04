@@ -1,0 +1,16 @@
+# .NET / VS / Rider
+**/bin/
+**/obj/
+.vs/
+.idea/
+*.user
+*.suo
+*.userprefs
+TestResults/
+# Логи/отчёты
+*.log
+coverage/
+coveragereport/
+# Пакеты/сборки
+*.nupkg
+packages/
