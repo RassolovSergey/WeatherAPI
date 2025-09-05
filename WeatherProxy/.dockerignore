@@ -1,0 +1,16 @@
+# Список файлов и папок, которые Docker должен игнорировать при сборке образа.
+@"
+**/bin/ 
+**/obj/
+**/TestResults/
+**/coveragereport/
+**/.vs/
+**/.idea/
+**/.git/
+**/.gitignore
+**/.gitattributes
+**/node_modules/
+*.user
+*.suo
+*.nupkg
+"@ | Out-File -Encoding UTF8 .dockerignore
