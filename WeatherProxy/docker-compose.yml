@@ -34,7 +34,11 @@ services:
       - "6379:6379"
     # Простейший healthcheck — ждём PONG
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli --raw -h 127.0.0.1 -p 6379 ping | grep -q PONG"]
+      test:
+        [
+          "CMD-SHELL",
+          "redis-cli --raw -h 127.0.0.1 -p 6379 ping | grep -q PONG",
+        ]
       interval: 5s
       timeout: 3s
       retries: 5
