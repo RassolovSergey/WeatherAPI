@@ -1,96 +1,163 @@
-using System.Net;                               // HttpStatusCode — для разборов ответов
-using System.Text.Json;                         // JsonSerializer — парсинг JSON
-using System.Text.Json.Serialization;           // JsonPropertyName — соответствие имён полей
-using Microsoft.Extensions.Options;             // IOptions<T> — доступ к конфигу
-using Weather.Application;                      // IWeatherProvider — порт приложения
-using Weather.Domain;                           // WeatherReport — доменная модель
-using Weather.Infrastructure.External.WeatherApi;
-using Weather.Infrastructure.Options;           // WeatherApiOptions — BaseUrl/ApiKey/Timeout
+using System.Net;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using Weather.Application;
+using Weather.Domain;
+using Weather.Infrastructure.Options;
 
 namespace Weather.Infrastructure;
 
 /// <summary>
-/// Клиент внешнего провайдера погоды (weatherapi.com).
-/// Делает GET /v1/current.json?q={city}&key={API_KEY} и маппит ответ в <see cref="WeatherReport"/>.
-/// ВАЖНО: ключ API берём только из переменных окружения/конфига (не храним в коде).
+/// HTTP-клиент к внешнему провайдеру weatherapi.com.
+/// Реализация порта <see cref="IWeatherProvider"/>.
 /// </summary>
 public sealed class WeatherApiClient : IWeatherProvider
 {
-    private readonly HttpClient _http;              // Typed HttpClient
-    private readonly WeatherApiOptions _opts;       // BaseUrl, ApiKey, Timeout (из конфигурации)
+    private readonly HttpClient _http;
+    private readonly WeatherApiOptions _options;
+    private readonly ILogger<WeatherApiClient> _logger;
 
-    public WeatherApiClient(HttpClient http, IOptions<WeatherApiOptions> opts)
+    // Единые настройки десериализации JSON
+    private static readonly JsonSerializerOptions _json = new(JsonSerializerDefaults.Web)
+    {
+        PropertyNameCaseInsensitive = true
+    };
+
+    public WeatherApiClient(
+        HttpClient http,
+        IOptions<WeatherApiOptions> options,
+        ILogger<WeatherApiClient> logger)
     {
         _http = http;
-        _opts = opts.Value;
+        _options = options.Value; // храним уже развернутые опции (без .Value в методах)
+        _logger = logger;
     }
 
+    // ------------------------- CURRENT -------------------------
+
+    /// <inheritdoc />
     public async Task<WeatherReport> GetCurrentAsync(string city, CancellationToken ct = default)
     {
-        // --- 1) Валидация и нормализация входа ---
         if (string.IsNullOrWhiteSpace(city))
-            throw new ArgumentException("City must be provided.", nameof(city));
+            throw new ArgumentException("city is required", nameof(city));
 
-        var q = city.Trim();
+        var q = Uri.EscapeDataString(city);
+        var url = $"v1/current.json?key={_options.ApiKey}&q={q}&aqi=no";
 
-        // --- 2) Проверяем наличие базового URL и ключа (подсказка разработчику) ---
-        if (string.IsNullOrWhiteSpace(_opts.BaseUrl))
-            throw new InvalidOperationException(
-                "WeatherApiOptions.BaseUrl is empty. " +
-                "Установите ENV WEATHERAPI__BASEURL (например, https://api.weatherapi.com/v1/).");
+        using var resp = await _http.GetAsync(url, ct);
 
-        if (string.IsNullOrWhiteSpace(_opts.ApiKey))
-            throw new InvalidOperationException(
-                "WeatherApiOptions.ApiKey is empty. " +
-                "Установите ENV WEATHERAPI__APIKEY (ключ от weatherapi.com).");
-
-        // --- 3) Формируем запрос ---
-        // В weatherapi.com ключ передаётся как query-параметр key=..., город — q=...
-        // Uri.EscapeDataString — экранируем пользовательский ввод (безопасность).
-        var url = $"current.json?key={Uri.EscapeDataString(_opts.ApiKey)}&q={Uri.EscapeDataString(q)}";
-
-        // --- 4) Делаем вызов ---
-        using var req = new HttpRequestMessage(HttpMethod.Get, url);
-        using var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
-
-        // --- 5) Базовая обработка ошибок провайдера ---
-        if (resp.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
-        {
-            // Обычно это неверный/просроченный ключ API
+        if ((int)resp.StatusCode is 401 or 403)
             throw new InvalidOperationException("WeatherAPI responded 401/403. Проверьте API ключ (WEATHERAPI__APIKEY).");
-        }
 
-        if (!resp.IsSuccessStatusCode)
-        {
-            var errorBody = await resp.Content.ReadAsStringAsync(ct);
-            // В учебных целях выбрасываем осмысленную ошибку с кодом и коротким телом
-            throw new HttpRequestException($"WeatherAPI error {(int)resp.StatusCode}: {errorBody}");
-        }
+        resp.EnsureSuccessStatusCode();
 
-        // --- 6) Декодируем JSON в минимальный внутренний DTO ---
         await using var stream = await resp.Content.ReadAsStreamAsync(ct);
+        var model = await JsonSerializer.DeserializeAsync<CurrentApiResponse>(stream, _json, ct)
+                    ?? throw new InvalidOperationException("Cannot parse WeatherAPI response");
 
-        var dto = await JsonSerializer.DeserializeAsync<WeatherApiCurrentDto>(
-            stream,
-            new JsonSerializerOptions
-            {
-                PropertyNameCaseInsensitive = true // на случай неожиданных регистров
-            },
-            ct);
-
-        if (dto is null || dto.Location is null || dto.Current is null || dto.Current.Condition is null)
-            throw new InvalidOperationException("WeatherAPI: unexpected JSON (missing required fields).");
-
-        // --- 7) Маппинг во внутреннюю доменную модель ---
-        var report = new WeatherReport(
-            City: dto.Location.Name ?? q,                 // если поставщик вернул иное имя — используем его
-            Country: dto.Location.Country ?? string.Empty,
-            TempC: dto.Current.TempC,
-            Condition: dto.Current.Condition.Text ?? "n/a",
-            FetchedAtUtc: DateTime.UtcNow,
-            Source: "origin"                              // источник: внешний провайдер
+        // ВАЖНО: WeatherReport имеет позиционный конструктор → передаем все аргументы по порядку.
+        return new WeatherReport(
+            model.location.name ?? city,                    // City
+            model.location.country ?? string.Empty,         // Country
+            model.current.temp_c,                           // TempC
+            model.current.condition?.text ?? string.Empty,  // Condition
+            DateTime.UtcNow,                                // FetchedAtUtc
+            "origin"                                        // Source
         );
+    }
 
-        return report;
+    // ------------------------- FORECAST -------------------------
+
+    /// <inheritdoc />
+    public async Task<ForecastReport> GetForecastAsync(string city, int days, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(city))
+            throw new ArgumentException("city is required", nameof(city));
+        if (days < 1 || days > 7)
+            throw new ArgumentOutOfRangeException(nameof(days), "days must be 1..7");
+
+        var q = Uri.EscapeDataString(city);
+        var url = $"v1/forecast.json?key={_options.ApiKey}&q={q}&days={days}&aqi=no&alerts=no";
+
+        using var resp = await _http.GetAsync(url, ct);
+
+        if ((int)resp.StatusCode is 401 or 403)
+            throw new InvalidOperationException("WeatherAPI responded 401/403. Проверьте API ключ (WEATHERAPI__APIKEY).");
+
+        resp.EnsureSuccessStatusCode();
+
+        await using var stream = await resp.Content.ReadAsStreamAsync(ct);
+        var model = await JsonSerializer.DeserializeAsync<ForecastApiResponse>(stream, _json, ct)
+                    ?? throw new InvalidOperationException("Cannot parse WeatherAPI forecast response");
+
+        var items = new List<ForecastDay>(capacity: model.forecast.forecastday.Count);
+        foreach (var d in model.forecast.forecastday)
+        {
+            if (!DateOnly.TryParse(d.date, out var date))
+                continue;
+
+            items.Add(new ForecastDay
+            {
+                Date = date,
+                MinTempC = d.day.mintemp_c,
+                MaxTempC = d.day.maxtemp_c,
+                Condition = d.day.condition?.text ?? string.Empty
+            });
+        }
+
+        return new ForecastReport
+        {
+            City = model.location.name ?? city,
+            Country = model.location.country ?? string.Empty,
+            Days = items.Count,
+            Items = items,
+            FetchedAtUtc = DateTime.UtcNow,
+            Source = "origin"
+        };
+    }
+
+    // ----------------------- JSON моделейки -----------------------
+
+    private sealed class CurrentApiResponse
+    {
+        public Location location { get; set; } = new();
+        public Current current { get; set; } = new();
+    }
+    private sealed class Current
+    {
+        public double temp_c { get; set; }
+        public Condition? condition { get; set; }
+    }
+
+    private sealed class ForecastApiResponse
+    {
+        public Location location { get; set; } = new();
+        public Forecast forecast { get; set; } = new();
+    }
+    private sealed class Location
+    {
+        public string? name { get; set; }
+        public string? country { get; set; }
+    }
+    private sealed class Forecast
+    {
+        public List<ForecastDayNode> forecastday { get; set; } = new();
+    }
+    private sealed class ForecastDayNode
+    {
+        public string date { get; set; } = "";
+        public Day day { get; set; } = new();
+    }
+    private sealed class Day
+    {
+        [JsonPropertyName("mintemp_c")] public double mintemp_c { get; set; }
+        [JsonPropertyName("maxtemp_c")] public double maxtemp_c { get; set; }
+        public Condition? condition { get; set; }
+    }
+    private sealed class Condition
+    {
+        public string? text { get; set; }
     }
 }

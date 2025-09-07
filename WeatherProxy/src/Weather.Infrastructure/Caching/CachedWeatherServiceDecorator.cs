@@ -1,91 +1,143 @@
-// Назначение: декоратор поверх IWeatherService, реализующий cache-aside с Redis.
-// Логика:
-//  - Пытаюсь прочитать WeatherReport из кэша по ключу "current:{slug}".
-//  - Если попали (cache hit): возвращаю объект с Source="cache".
-//  - Если промах: дергаю "inner" (реальный провайдер через WeatherService -> WeatherApiClient),
-//                кладу результат в кэш с TTL и возвращаю с Source="origin".
-//
-// Важно: здесь мы не тащим детали DI — только зависим от IDistributedCache.
-
-using System.Text.Json;                         // сериализация в строку для кэша
-using Microsoft.Extensions.Caching.Distributed; // IDistributedCache
-using Microsoft.Extensions.Logging; // логирование (полезно при ошибках кэша)
-using Weather.Application;  // IWeatherService
-using Weather.Domain;   // WeatherReport
+using System.Text.Json;
+using Microsoft.Extensions.Caching.Distributed;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using Weather.Application;
+using Weather.Domain;
 using Weather.Infrastructure.Options;
 
-namespace Weather.Infrastructure.Caching
+namespace Weather.Infrastructure.Caching;
 
+/// <summary>
+/// Декоратор прикладного сервиса, добавляющий кэш Redis (IDistributedCache).
+/// Схема ключей внутри приложения:
+///   - current : current:{slug}
+///   - forecast: forecast:{slug}:{days}
+/// Провайдер StackExchangeRedisCache сам добавит InstanceName ("weather:") перед ключом,
+/// так что в Redis будут ключи: weather:current:... и weather:forecast:...
+/// </summary>
+public sealed class CachedWeatherServiceDecorator : IWeatherService
 {
-    public sealed class CachedWeatherServiceDecorator : IWeatherService
+    private readonly IWeatherService _inner;
+    private readonly IDistributedCache _cache;
+    private readonly ILogger<CachedWeatherServiceDecorator> _logger;
+    private readonly IOptions<CachingOptions> _caching;
+
+    private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
+
+    public CachedWeatherServiceDecorator(
+        IWeatherService inner,
+        IDistributedCache cache,
+        ILogger<CachedWeatherServiceDecorator> logger,
+        IOptions<CachingOptions> caching)
     {
-        private readonly IWeatherService _inner;    // исходная реализация (делегат)
-        private readonly IDistributedCache _cache;  // Redis (через StackExchange.Redis)
-        private readonly ILogger<CachedWeatherServiceDecorator> _logger; // логирование ошибок кэша
-        private readonly TimeSpan _ttlCurrent;  // TTL для текущей погоды
+        _inner = inner;
+        _cache = cache;
+        _logger = logger;
+        _caching = caching;
+    }
 
-        // TTL для текущей погоды: 15 минут (можно вынести в конфиг позже)
-        private static readonly DistributedCacheEntryOptions TtlCurrent =
-            new() { AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(15) };
+    private static string Slug(string city) => city.Trim().ToLowerInvariant();
 
-        public CachedWeatherServiceDecorator(
-            IWeatherService inner,
-            IDistributedCache cache,
-            ILogger<CachedWeatherServiceDecorator> logger,
-            IOptions<CachingOptions> caching)
+    // -------------------------- CURRENT --------------------------
+
+    public async Task<WeatherReport> GetCurrentAsync(string city, CancellationToken ct = default)
+    {
+        var slug = Slug(city);
+        // ВНИМАНИЕ: без "weather:" — его добавит InstanceName.
+        var key = $"current:{slug}";
+
+        // 1) Попытка чтения из кэша
+        var cachedJson = await _cache.GetStringAsync(key, ct);
+        if (!string.IsNullOrEmpty(cachedJson))
         {
-            _inner = inner;
-            _cache = cache;
-            _logger = logger;
-            _ttlCurrent = TimeSpan.FromMinutes(
-                Math.Max(1, caching.Value.CurrentTtlMinutes));
-        }
-
-        public async Task<WeatherReport> GetCurrentAsync(string city, CancellationToken ct = default)
-        {
-            // 1) Генерирую ключ
-            var key = CacheKeyBuilder.CurrentKey(city);
-
             try
             {
-                // 2) Пытаюсь прочитать JSON из кэша
-                var cachedJson = await _cache.GetStringAsync(key, ct);
-                if (!string.IsNullOrEmpty(cachedJson))
+                var fromCache = System.Text.Json.JsonSerializer.Deserialize<WeatherReport>(cachedJson, Json);
+                if (fromCache is not null)
                 {
-                    var cached = JsonSerializer.Deserialize<WeatherReport>(cachedJson);
-                    if (cached is not null)
-                    {
-                        // Явно отмечаем источник как "cache"
-                        return cached with { Source = "cache" };
-                    }
+                    var result = fromCache with { Source = "cache" };
+                    _logger.LogDebug("Cache HIT current → {Key}", key);
+                    return result;
                 }
             }
             catch (Exception ex)
             {
-                // Ошибку кэша не считаем фатальной — просто логируем и идём к провайдеру.
-                _logger.LogWarning(ex, "Redis read failed for key {Key}", key);
+                _logger.LogWarning(ex, "Failed to deserialize cached current weather for {Key}", key);
             }
+        }
 
-            // 3) Промах — дергаем реальную реализацию
-            var fresh = await _inner.GetCurrentAsync(city, ct);
+        _logger.LogDebug("Cache MISS current → {Key}", key);
 
+        // 2) Промах — идём во внешний провайдер
+        var fresh = await _inner.GetCurrentAsync(city, ct);
+
+        // 3) Кладём в кэш
+        var ttlMinutes = Math.Max(1, _caching.Value.CurrentTtlMinutes);
+        var options = new DistributedCacheEntryOptions
+        {
+            AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(ttlMinutes)
+        };
+
+        var payload = System.Text.Json.JsonSerializer.Serialize(fresh, Json);
+        await _cache.SetStringAsync(key, payload, options, ct);
+
+        return fresh;
+    }
+
+    // -------------------------- FORECAST --------------------------
+
+    public async Task<ForecastReport> GetForecastAsync(string city, int days, CancellationToken ct = default)
+    {
+        var slug = Slug(city);
+        // ВНИМАНИЕ: без "weather:" — его добавит InstanceName.
+        var key = $"forecast:{slug}:{days}";
+
+        // 1) Попытка чтения из кэша
+        var cachedJson = await _cache.GetStringAsync(key, ct);
+        if (!string.IsNullOrEmpty(cachedJson))
+        {
             try
             {
-                // 4) Кладём в кэш (сохраняем то, что пришло, без смены Source)
-                var json = JsonSerializer.Serialize(fresh);
-                var options = new DistributedCacheEntryOptions
+                var fromCache = System.Text.Json.JsonSerializer.Deserialize<ForecastReport>(cachedJson, Json);
+                if (fromCache is not null)
                 {
-                    AbsoluteExpirationRelativeToNow = _ttlCurrent // <-- TTL из конфигурации
-                };
-                await _cache.SetStringAsync(key, json, TtlCurrent, ct);
+                    var cached = new ForecastReport
+                    {
+                        City = fromCache.City,
+                        Country = fromCache.Country,
+                        Days = fromCache.Days,
+                        Items = fromCache.Items,
+                        FetchedAtUtc = fromCache.FetchedAtUtc,
+                        Source = "cache"
+                    };
+
+                    _logger.LogDebug("Cache HIT forecast → {Key}", key);
+                    return cached;
+                }
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "Redis write failed for key {Key}", key);
+                _logger.LogWarning(ex, "Failed to deserialize cached forecast for {Key}", key);
             }
-
-            return fresh; // здесь Source обычно "origin"
         }
+
+        _logger.LogDebug("Cache MISS forecast → {Key}", key);
+
+        // 2) Промах — идём к провайдеру
+        var fresh = await _inner.GetForecastAsync(city, days, ct);
+
+        // 3) Кладём в кэш
+        // TODO: при наличии ForecastTtlMinutes использовать его здесь.
+        var ttlMinutes = Math.Max(1, _caching.Value.ForecastTtlMinutes);
+        var options = new DistributedCacheEntryOptions
+        {
+            AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(ttlMinutes)
+        };
+
+        var payload = System.Text.Json.JsonSerializer.Serialize(fresh, Json);
+        await _cache.SetStringAsync(key, payload, options, ct);
+
+        return fresh;
     }
 }

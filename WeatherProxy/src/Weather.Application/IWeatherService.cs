@@ -1,17 +1,18 @@
-﻿using Weather.Domain;
+﻿using System.Threading;
+using System.Threading.Tasks;
+using Weather.Domain;
 
-namespace Weather.Application
+namespace Weather.Application;
+
+/// <summary>
+/// Прикладной сервис — то, что дергает наш API.
+/// Внутри может быть кэш-декоратор и пр.
+/// </summary>
+public interface IWeatherService
 {
-    /// <summary>
-    /// Порт приложения: сценарии работы с погодой,
-    /// которые вызывает Web API. Реализации находятся в Infrastructure.
-    /// </summary>
-    public interface IWeatherService
-    {
-        /// <summary>
-        /// Получить текущую погоду по городу.
-        /// Реализация сама решает: кэш, внешний API и т.п.
-        /// </summary>
-        Task<WeatherReport> GetCurrentAsync(string city, CancellationToken ct = default);
-    }
+    /// <summary>Текущая погода.</summary>
+    Task<WeatherReport> GetCurrentAsync(string city, CancellationToken ct = default);
+
+    /// <summary>Прогноз на N дней.</summary>
+    Task<ForecastReport> GetForecastAsync(string city, int days, CancellationToken ct = default);
 }
