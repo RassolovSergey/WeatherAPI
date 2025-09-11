@@ -1,16 +1,28 @@
-# .NET / VS / Rider
+@'
+# === Secrets & local env ===
+.env
+
+# === Dotnet artifacts ===
 **/bin/
 **/obj/
-.vs/
-.idea/
+**/TestResults/
+**/coveragereport/
+
+# === IDE ===
+**/.vs/
+**/.vscode/
+**/.idea/
+
+# === Git metadata ===
+**/.git/
+**/.gitattributes
+
+# === Node ===
+**/node_modules/
+
+# === Misc ===
 *.user
 *.suo
-*.userprefs
-TestResults/
-# Логи/отчёты
-*.log
-coverage/
-coveragereport/
-# Пакеты/сборки
 *.nupkg
-packages/
+*.DS_Store
+'@ | Set-Content -Encoding UTF8 .gitignore
