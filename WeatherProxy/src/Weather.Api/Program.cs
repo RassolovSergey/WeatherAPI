@@ -17,7 +17,8 @@ using Weather.Infrastructure.Caching;                    // CachedWeatherService
 using Weather.Infrastructure.Options;                    // WeatherApiOptions, CachingOptions
 using Weather.Infrastructure.Http;                       // LoggingHttpMessageHandler
 using Weather.Api.Health;                                // RedisCacheHealthCheck
-using Weather.Api.Middleware;                            // CorrelationIdMiddleware
+using Weather.Api.Middleware;
+using Prometheus;                            // CorrelationIdMiddleware
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -60,6 +61,7 @@ builder.Services.AddStackExchangeRedisCache(options =>
 // Прямой доступ к Redis (для dev-инструментов, health и т.п.)
 builder.Services.AddSingleton<IConnectionMultiplexer>(_ =>
     ConnectionMultiplexer.Connect(redisConnStr));        // уже проверено, не null
+
 
 // ============================== Swagger =====================================
 
@@ -134,6 +136,11 @@ builder.Services.AddProblemDetails(options =>
 // ================================ App =======================================
 
 var app = builder.Build();
+
+// Метрики HTTP и эндпоинт для Prometheus
+app.UseHttpMetrics();         // собирает метрики по входящим HTTP
+app.MapMetrics("/metrics");   // отдать метрики здесь
+
 
 if (app.Environment.IsDevelopment())
 {

@@ -17,6 +17,8 @@ services:
       # Жду готовности Redis по healthcheck, прежде чем стартовать API
       redis:
         condition: service_healthy
+    env_file:
+      - .env
 
   redis:
     image: redis:7-alpine

@@ -128,7 +128,7 @@ appsettings.json (фрагмент)
 
     dotnet build
     dotnet run --project src/Weather.Api
-    # Swagger: http://localhost:5232/swagger
+    # Swagger: http://localhost:8080/swagger
 
 Docker + Redis
 
