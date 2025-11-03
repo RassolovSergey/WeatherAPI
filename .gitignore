@@ -1,4 +1,3 @@
-@'
 # === Secrets & local env ===
 .env
 
@@ -25,4 +24,3 @@
 *.suo
 *.nupkg
 *.DS_Store
-'@ | Set-Content -Encoding UTF8 .gitignore

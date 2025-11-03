@@ -8,17 +8,13 @@ services:
     ports:
       - "8080:8080"
     # Окружение берётся из .env + эти доп.переменные
-    environment:
-      ASPNETCORE_ENVIRONMENT: ${ASPNETCORE_ENVIRONMENT} # Development → включит Swagger
-      WEATHERAPI__BASEURL: ${WEATHERAPI__BASEURL} # базовый URL провайдера
-      WEATHERAPI__APIKEY: ${WEATHERAPI__APIKEY} # ключ провайдера (заполни позже)
-      REDIS__CONNECTIONSTRING: ${REDIS__CONNECTIONSTRING} # строка подключения к Redis
     depends_on:
       # Жду готовности Redis по healthcheck, прежде чем стартовать API
       redis:
         condition: service_healthy
     env_file:
       - .env
+    restart: unless-stopped # рестарт при падении, но не при остановке вручную
 
   redis:
     image: redis:7-alpine
@@ -45,3 +41,8 @@ services:
       timeout: 3s
       retries: 5
       start_period: 5s
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+volumes:
+  redis-data: {}

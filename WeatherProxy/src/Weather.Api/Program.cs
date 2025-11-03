@@ -1,16 +1,14 @@
+using System;
+using Microsoft.AspNetCore.Cors.Infrastructure;
 using System.Threading.RateLimiting;
 using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.Extensions.Caching.Distributed;          // IDistributedCache
 using Microsoft.Extensions.Options;                      // IOptions<T>
 using Microsoft.OpenApi.Models;
-using Microsoft.Extensions.Http.Resilience;              // Polly v8 handler
-using Microsoft.AspNetCore.Http;                         // StatusCodes
 using Microsoft.AspNetCore.Diagnostics;                  // IExceptionHandlerFeature
-using Microsoft.AspNetCore.Mvc.Infrastructure;           // IProblemDetailsService, ProblemDetailsContext
 using Microsoft.Extensions.Diagnostics.HealthChecks;     // HealthStatus
 using Polly.Timeout;                                     // TimeoutRejectedException
 using StackExchange.Redis;                               // IConnectionMultiplexer
-
 using Weather.Application;                               // IWeatherService, IWeatherProvider
 using Weather.Infrastructure;                            // WeatherService, WeatherApiClient
 using Weather.Infrastructure.Caching;                    // CachedWeatherServiceDecorator
@@ -18,9 +16,35 @@ using Weather.Infrastructure.Options;                    // WeatherApiOptions, C
 using Weather.Infrastructure.Http;                       // LoggingHttpMessageHandler
 using Weather.Api.Health;                                // RedisCacheHealthCheck
 using Weather.Api.Middleware;
-using Prometheus;                            // CorrelationIdMiddleware
 
 var builder = WebApplication.CreateBuilder(args);
+
+// Проверка
+// Читаем CSV со списком origin'ов из переменных окружения (.env)
+var originsCsv = builder.Configuration["CORS:ALLOWEDORIGINS"] ?? string.Empty;  // // значение из CORS__ALLOWEDORIGINS
+var origins = originsCsv
+    .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries); // // разобьём по запятой
+
+// Регистрируем CORS-политику "Default"
+builder.Services.AddCors(o =>
+{
+    o.AddPolicy("Default", p =>
+    {
+        if (origins.Length > 0)
+        {
+            p.WithOrigins(origins)  // Разрешённые источники
+             .AllowAnyHeader()  // Разрешаем любые заголовки
+             .AllowAnyMethod(); // Разрешаем любые методы
+        }
+        else
+        {
+            // Dev-фоллбек: если список пуст, открываем всем (не делай так в проде)
+            p.AllowAnyOrigin()
+             .AllowAnyHeader()
+             .AllowAnyMethod();
+        }
+    });
+});
 
 // =========================== Конфигурация/Options ===========================
 
@@ -137,9 +161,8 @@ builder.Services.AddProblemDetails(options =>
 
 var app = builder.Build();
 
-// Метрики HTTP и эндпоинт для Prometheus
-app.UseHttpMetrics();         // собирает метрики по входящим HTTP
-app.MapMetrics("/metrics");   // отдать метрики здесь
+// Включаем CORS в пайплайне ДО объявления маршрутов
+app.UseCors("Default"); // CORS-проверки + ответы на preflight (OPTIONS)
 
 
 if (app.Environment.IsDevelopment())
@@ -155,6 +178,19 @@ app.UseExceptionHandler(errorApp =>
     {
         var ex = context.Features.Get<IExceptionHandlerFeature>()?.Error;
 
+        // Спец-случай: провайдер отклонил API-ключ (401/403 от WeatherAPI)
+        if (ex is InvalidOperationException inv &&
+            inv.Message.StartsWith("WeatherAPI responded 401/403", StringComparison.OrdinalIgnoreCase))
+        {
+            await Results.Problem(
+                title: "Weather provider rejected API key",
+                detail: "Upstream returned 401/403. Check WEATHERAPI__APIKEY value.",
+                statusCode: StatusCodes.Status502BadGateway
+            ).ExecuteAsync(context);
+            return;
+        }
+
+        // Базовые маппинги (оставляем как у тебя)
         var status = ex switch
         {
             ArgumentException => StatusCodes.Status400BadRequest,
@@ -174,6 +210,7 @@ app.UseExceptionHandler(errorApp =>
         });
     });
 });
+
 
 // Корреляция запросов
 app.UseMiddleware<CorrelationIdMiddleware>();
