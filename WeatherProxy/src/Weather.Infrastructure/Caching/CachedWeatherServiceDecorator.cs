@@ -37,15 +37,12 @@ public sealed class CachedWeatherServiceDecorator : IWeatherService
         _caching = caching;
     }
 
-    private static string Slug(string city) => city.Trim().ToLowerInvariant();
-
     // -------------------------- CURRENT --------------------------
 
     public async Task<WeatherReport> GetCurrentAsync(string city, CancellationToken ct = default)
     {
-        var slug = Slug(city);
         // ВНИМАНИЕ: без "weather:" — его добавит InstanceName.
-        var key = $"current:{slug}";
+        var key = CacheKeyBuilder.CurrentKey(city);
 
         // 1) Попытка чтения из кэша
         var cachedJson = await _cache.GetStringAsync(key, ct);
@@ -89,9 +86,8 @@ public sealed class CachedWeatherServiceDecorator : IWeatherService
 
     public async Task<ForecastReport> GetForecastAsync(string city, int days, CancellationToken ct = default)
     {
-        var slug = Slug(city);
         // ВНИМАНИЕ: без "weather:" — его добавит InstanceName.
-        var key = $"forecast:{slug}:{days}";
+        var key = CacheKeyBuilder.ForecastKey(city, days);
 
         // 1) Попытка чтения из кэша
         var cachedJson = await _cache.GetStringAsync(key, ct);

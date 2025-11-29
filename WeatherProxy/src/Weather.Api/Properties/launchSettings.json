@@ -7,7 +7,10 @@
       "launchBrowser": false,
       "applicationUrl": "http://localhost:5277",
       "environmentVariables": {
-        "ASPNETCORE_ENVIRONMENT": "Development"
+        "ASPNETCORE_ENVIRONMENT": "Development",
+        "REDIS__CONNECTIONSTRING": "localhost:6379,abortConnect=false",
+        "WEATHERAPI__BASEURL": "https://api.weatherapi.com/v1/",
+        "WEATHERAPI__APIKEY": "cf4f766c73854a3e91e142502250509"
       }
     },
     "https": {
@@ -16,7 +19,10 @@
       "launchBrowser": false,
       "applicationUrl": "https://localhost:7239;http://localhost:5277",
       "environmentVariables": {
-        "ASPNETCORE_ENVIRONMENT": "Development"
+        "ASPNETCORE_ENVIRONMENT": "Development",
+        "REDIS__CONNECTIONSTRING": "localhost:6379,abortConnect=false",
+        "WEATHERAPI__BASEURL": "https://api.weatherapi.com/v1/",
+        "WEATHERAPI__APIKEY": "cf4f766c73854a3e91e142502250509"
       }
     }
   }

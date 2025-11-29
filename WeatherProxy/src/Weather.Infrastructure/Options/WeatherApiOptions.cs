@@ -8,6 +8,7 @@ public sealed class WeatherApiOptions
     /// Имя секции в конфигурации (appsettings.json / ENV / etc).
     /// </summary>
     public const string SectionName = "WeatherApi";
+    public const int DefaultMaxForecastDays = 3;
 
     /// <summary>
     /// Базовый URL внешнего API, например: "http://api.weatherapi.com/v1/"
@@ -21,6 +22,13 @@ public sealed class WeatherApiOptions
     /// </summary>
     [Required]
     public string ApiKey { get; init; } = string.Empty;
+
+    /// <summary>
+    /// Максимальное количество дней прогноза, разрешённое текущим тарифом провайдера.
+    /// Бесплатный план обычно даёт до 3 дней, но некоторые ключи ограничены одним.
+    /// </summary>
+    [Range(1, 10)]
+    public int MaxForecastDays { get; init; } = DefaultMaxForecastDays;
 
     // ВАЛИДНАЯ форма для TimeSpan: указываем тип и границы как строки "hh:mm:ss".
     // Разрешаем 1..60 секунд. По умолчанию 8 секунд.

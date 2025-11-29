@@ -8,7 +8,7 @@ using System.Text.RegularExpressions;
 
 namespace Weather.Infrastructure.Caching;
 
-internal static class CacheKeyBuilder
+public static class CacheKeyBuilder
 {
     private static readonly Regex NonSlugChars = new("[^a-z0-9\\-]+", RegexOptions.Compiled);
 

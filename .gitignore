@@ -1,5 +1,8 @@
 # === Secrets & local env ===
 .env
+.env.local
+.env.*.local
+*.env
 
 # === Dotnet artifacts ===
 **/bin/
@@ -12,12 +15,16 @@
 **/.vscode/
 **/.idea/
 
-# === Git metadata ===
-**/.git/
-**/.gitattributes
-
-# === Node ===
+# === Node / Next.js ===
 **/node_modules/
+**/.next/
+**/out/
+**/.turbo/
+**/.parcel-cache/
+
+# === Logs & coverage ===
+*.log
+coverage/
 
 # === Misc ===
 *.user

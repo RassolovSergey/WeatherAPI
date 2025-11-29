@@ -18,6 +18,7 @@ public sealed class WeatherApiClient : IWeatherProvider
     private readonly HttpClient _http;
     private readonly WeatherApiOptions _options;
     private readonly ILogger<WeatherApiClient> _logger;
+    private readonly string _encodedApiKey;
 
     // Единые настройки десериализации JSON
     private static readonly JsonSerializerOptions _json = new(JsonSerializerDefaults.Web)
@@ -33,6 +34,7 @@ public sealed class WeatherApiClient : IWeatherProvider
         _http = http;
         _options = options.Value; // храним уже развернутые опции (без .Value в методах)
         _logger = logger;
+        _encodedApiKey = Uri.EscapeDataString(_options.ApiKey ?? string.Empty);
     }
 
     // ------------------------- CURRENT -------------------------
@@ -44,7 +46,8 @@ public sealed class WeatherApiClient : IWeatherProvider
             throw new ArgumentException("city is required", nameof(city));
 
         var q = Uri.EscapeDataString(city);
-        var url = $"v1/current.json?key={_options.ApiKey}&q={q}&aqi=no";
+        // BaseAddress указывает на /v1/, поэтому используем относительный путь без повторного "v1/".
+        var url = $"current.json?key={_encodedApiKey}&q={q}&aqi=no";
 
         using var resp = await _http.GetAsync(url, ct);
 
@@ -75,11 +78,13 @@ public sealed class WeatherApiClient : IWeatherProvider
     {
         if (string.IsNullOrWhiteSpace(city))
             throw new ArgumentException("city is required", nameof(city));
-        if (days < 1 || days > 7)
-            throw new ArgumentOutOfRangeException(nameof(days), "days must be 1..7");
+        var maxDays = _options.MaxForecastDays;
+        if (days < 1 || days > maxDays)
+            throw new ArgumentOutOfRangeException(nameof(days), $"days must be 1..{maxDays} (limited by provider plan)");
 
         var q = Uri.EscapeDataString(city);
-        var url = $"v1/forecast.json?key={_options.ApiKey}&q={q}&days={days}&aqi=no&alerts=no";
+        // BaseAddress указывает на /v1/, поэтому используем относительный путь без повторного "v1/".
+        var url = $"forecast.json?key={_encodedApiKey}&q={q}&days={days}&aqi=no&alerts=no";
 
         using var resp = await _http.GetAsync(url, ct);
 

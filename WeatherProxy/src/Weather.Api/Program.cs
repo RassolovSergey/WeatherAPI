@@ -1,38 +1,84 @@
 using System;
+using System.Collections.Generic;
 using Microsoft.AspNetCore.Cors.Infrastructure;
 using System.Threading.RateLimiting;
 using Microsoft.AspNetCore.RateLimiting;
-using Microsoft.Extensions.Caching.Distributed;          // IDistributedCache
-using Microsoft.Extensions.Options;                      // IOptions<T>
+using Microsoft.Extensions.Caching.Distributed;
+using Microsoft.Extensions.Options;
 using Microsoft.OpenApi.Models;
-using Microsoft.AspNetCore.Diagnostics;                  // IExceptionHandlerFeature
-using Microsoft.Extensions.Diagnostics.HealthChecks;     // HealthStatus
-using Polly.Timeout;                                     // TimeoutRejectedException
-using StackExchange.Redis;                               // IConnectionMultiplexer
-using Weather.Application;                               // IWeatherService, IWeatherProvider
-using Weather.Infrastructure;                            // WeatherService, WeatherApiClient
-using Weather.Infrastructure.Caching;                    // CachedWeatherServiceDecorator
-using Weather.Infrastructure.Options;                    // WeatherApiOptions, CachingOptions
-using Weather.Infrastructure.Http;                       // LoggingHttpMessageHandler
-using Weather.Api.Health;                                // RedisCacheHealthCheck
+using Microsoft.AspNetCore.Diagnostics;
+using Microsoft.Extensions.Diagnostics.HealthChecks;
+using Polly.Timeout;
+using StackExchange.Redis;
+using Weather.Application;
+using Weather.Infrastructure;
+using Weather.Infrastructure.Caching;
+using Weather.Infrastructure.Options;
+using Weather.Infrastructure.Http;
+using Weather.Api.Health;
 using Weather.Api.Middleware;
+using Prometheus;
+using Prometheus.DotNetRuntime;
+using System.IO;
 
 var builder = WebApplication.CreateBuilder(args);
+_ = DotNetRuntimeStatsBuilder.Default().StartCollecting();
+
+// --------------------------- Load .env (dev helper) --------------------------
+// Если ключи заданы в .env (рядом с решением) и не проброшены в переменные окружения,
+// подтягиваем их вручную, не затирая уже установленные значения.
+var envFile = Path.Combine(builder.Environment.ContentRootPath, "..", "..", ".env");
+if (File.Exists(envFile))
+{
+    foreach (var line in File.ReadAllLines(envFile))
+    {
+        if (string.IsNullOrWhiteSpace(line) || line.TrimStart().StartsWith("#"))
+            continue;
+        var idx = line.IndexOf('=');
+        if (idx <= 0) continue;
+        var key = line[..idx].Trim();
+        var value = line[(idx + 1)..].Trim();
+        if (string.IsNullOrEmpty(key) || string.IsNullOrEmpty(value)) continue;
+        var current = Environment.GetEnvironmentVariable(key);
+        if (string.IsNullOrWhiteSpace(current))
+            Environment.SetEnvironmentVariable(key, value);
+    }
+}
+
+// После подстановки из .env добавляем провайдер окружения, чтобы конфиг увидел новые значения
+builder.Configuration.AddEnvironmentVariables();
+
+var configuredMaxForecastDays =
+    builder.Configuration.GetValue<int?>($"{WeatherApiOptions.SectionName}:MaxForecastDays")
+    ?? WeatherApiOptions.DefaultMaxForecastDays;
 
 // Проверка
 // Читаем CSV со списком origin'ов из переменных окружения (.env)
-var originsCsv = builder.Configuration["CORS:ALLOWEDORIGINS"] ?? string.Empty;  // // значение из CORS__ALLOWEDORIGINS
+var originsCsv = builder.Configuration["CORS:ALLOWEDORIGINS"] ?? string.Empty;
 var origins = originsCsv
-    .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries); // // разобьём по запятой
+    .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+var allowLoopbackInDev = builder.Environment.IsDevelopment();
 
 // Регистрируем CORS-политику "Default"
 builder.Services.AddCors(o =>
 {
     o.AddPolicy("Default", p =>
     {
-        if (origins.Length > 0)
+        if (origins.Count > 0)
         {
-            p.WithOrigins(origins)  // Разрешённые источники
+            p.SetIsOriginAllowed(origin =>
+            {
+                // Dev-хелпер: разрешаем любой loopback (любой порт), даже если не перечислен в .env
+                if (allowLoopbackInDev &&
+                    Uri.TryCreate(origin, UriKind.Absolute, out var uri) &&
+                    uri.IsLoopback)
+                {
+                    return true;
+                }
+
+                return origins.Contains(origin);
+            })
              .AllowAnyHeader()  // Разрешаем любые заголовки
              .AllowAnyMethod(); // Разрешаем любые методы
         }
@@ -124,6 +170,7 @@ builder.Services.AddHttpClient<IWeatherProvider, WeatherApiClient>((sp, http) =>
     var opts = sp.GetRequiredService<IOptions<WeatherApiOptions>>().Value;
     if (!string.IsNullOrWhiteSpace(opts.BaseUrl))
         http.BaseAddress = new Uri(opts.BaseUrl);
+    http.Timeout = opts.Timeout;
 })
 .AddHttpMessageHandler<LoggingHttpMessageHandler>()
 .AddStandardResilienceHandler(o =>
@@ -216,8 +263,10 @@ app.UseExceptionHandler(errorApp =>
 app.UseMiddleware<CorrelationIdMiddleware>();
 
 app.UseRateLimiter();
+app.UseHttpMetrics();
 
 app.MapHealthChecks("/healthz");
+app.MapMetrics();
 
 // ----------------------------- Weather API ----------------------------------
 
@@ -225,20 +274,28 @@ var weather = app.MapGroup("/api/v1/weather")
     .WithTags("Weather")
     .RequireRateLimiting("per-ip-60rpm");
 // GET /api/v1/weather/forecast
-weather.MapGet("/forecast", async (string city, int days, IWeatherService svc, CancellationToken ct) =>
+weather.MapGet("/forecast", async (string city, int days, IWeatherService svc, IOptions<WeatherApiOptions> weatherApiOptions, CancellationToken ct) =>
 {
     if (string.IsNullOrWhiteSpace(city) || city.Length > 64)
         return Results.BadRequest(new { error = "Invalid 'city'." });
-    if (days < 1 || days > 7)
-        return Results.BadRequest(new { error = "Invalid 'days' (1..7)." });
+
+    var maxDays = weatherApiOptions.Value.MaxForecastDays;
+    if (days < 1 || days > maxDays)
+        return Results.BadRequest(new { error = $"Invalid 'days' (1..{maxDays} for current provider plan)." });
 
     var report = await svc.GetForecastAsync(city, days, ct);
     return Results.Ok(report);
 })
 .WithSummary("Get multi-day forecast")
-.WithDescription("Реальные данные прогноза с провайдера. Кэш добавим отдельно.")
+.WithDescription($"Реальные данные прогноза с провайдера + Redis-кэш (cache-aside). Лимит текущего плана провайдера — до {configuredMaxForecastDays} дней.")
 .Produces<Weather.Domain.ForecastReport>(StatusCodes.Status200OK)
-.Produces(StatusCodes.Status400BadRequest);
+.Produces(StatusCodes.Status400BadRequest)
+.WithOpenApi(op =>
+{
+    op.Parameters[0].Description = "Город (UTF-8). Будет нормализован до slug для кэша.";
+    op.Parameters[1].Description = $"Сколько дней прогноза (1..{configuredMaxForecastDays} для текущего плана провайдера).";
+    return op;
+});
 
 // GET /api/v1/weather/current
 weather.MapGet("/current", async (string city, IWeatherService svc, CancellationToken ct) =>
@@ -252,7 +309,12 @@ weather.MapGet("/current", async (string city, IWeatherService svc, Cancellation
 .WithSummary("Get current weather")
 .WithDescription("Реальные данные с провайдера + Redis-кэш (cache-aside).")
 .Produces<Weather.Domain.WeatherReport>(StatusCodes.Status200OK)
-.Produces(StatusCodes.Status400BadRequest);
+.Produces(StatusCodes.Status400BadRequest)
+.WithOpenApi(op =>
+{
+    op.Parameters[0].Description = "Город (UTF-8). Будет нормализован до slug для кэша.";
+    return op;
+});
 
 // ------------------------------- Dev cache ----------------------------------
 
@@ -260,35 +322,46 @@ if (app.Environment.IsDevelopment())
 {
     var dev = app.MapGroup("/api/v1/dev/cache").WithTags("Dev/Cache");
 
-    static string Slug(string city) => city.Trim().ToLowerInvariant();
-
     dev.MapDelete("/current", async (string city, IConnectionMultiplexer mux, CancellationToken ct) =>
     {
         if (string.IsNullOrWhiteSpace(city) || city.Length > 64)
             return Results.BadRequest(new { error = "Invalid 'city'." });
 
-        var key = $"weather:current:{Slug(city)}";
+        var key = $"weather:{CacheKeyBuilder.CurrentKey(city)}";
         var db = mux.GetDatabase();
         bool removed = await db.KeyDeleteAsync(key);
         return Results.Ok(new { removed, key });
     })
     .WithSummary("Invalidate current-weather cache")
-    .WithDescription("Удаляет ключ weather:current:{city}");
+    .WithDescription("Удаляет ключ weather:current:{city}")
+    .WithOpenApi(op =>
+    {
+        op.Parameters[0].Description = "Город (UTF-8). Нормализуется до slug так же, как и при кэшировании.";
+        return op;
+    });
 
-    dev.MapDelete("/forecast", async (string city, int days, IConnectionMultiplexer mux, CancellationToken ct) =>
+    dev.MapDelete("/forecast", async (string city, int days, IConnectionMultiplexer mux, IOptions<WeatherApiOptions> weatherApiOptions, CancellationToken ct) =>
     {
         if (string.IsNullOrWhiteSpace(city) || city.Length > 64)
             return Results.BadRequest(new { error = "Invalid 'city'." });
-        if (days < 1 || days > 7)
-            return Results.BadRequest(new { error = "Invalid 'days' (1..7)." });
 
-        var key = $"weather:forecast:{Slug(city)}:{days}";
+        var maxDays = weatherApiOptions.Value.MaxForecastDays;
+        if (days < 1 || days > maxDays)
+            return Results.BadRequest(new { error = $"Invalid 'days' (1..{maxDays} for current provider plan)." });
+
+        var key = $"weather:{CacheKeyBuilder.ForecastKey(city, days)}";
         var db = mux.GetDatabase();
         bool removed = await db.KeyDeleteAsync(key);
         return Results.Ok(new { removed, key });
     })
     .WithSummary("Invalidate forecast cache")
-    .WithDescription("Удаляет ключ weather:forecast:{city}:{days}");
+    .WithDescription("Удаляет ключ weather:forecast:{city}:{days}")
+    .WithOpenApi(op =>
+    {
+        op.Parameters[0].Description = "Город (UTF-8). Нормализуется до slug так же, как и при кэшировании.";
+        op.Parameters[1].Description = $"Сколько дней прогноза (1..{configuredMaxForecastDays} для текущего плана провайдера) — часть ключа.";
+        return op;
+    });
 }
 
 app.Run();
